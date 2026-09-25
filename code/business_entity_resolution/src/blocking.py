@@ -1,26 +1,28 @@
 """
-blocking.py
+blocking.py (v4 - chunked streaming, low-memory)
 Business Entity Resolution Challenge - Amazon ML Challenge 2026
 
-Candidate generation stage: for each Source1 entity, find plausible
-candidate matches from Source2 and Source3 using normalized-name
-similarity search. This sets the recall ceiling for the whole pipeline,
-so it deliberately over-generates (favor recall here; precision is the
-matching model's job).
+v3 still loaded full Source2/Source3 files into pandas DataFrames before
+indexing - with 5M+ rows each and 3 text columns, that alone can exceed
+several GB of RAM (pandas stores strings as Python objects with real
+overhead). On a memory-constrained instance (e.g. t3.medium, ~3.7GB, no
+swap), this gets OOM-killed before blocking logic even runs.
+
+v4 never holds a full source file in memory. It streams Source2/Source3
+in chunks to build the (already-capped) bucket index, then streams
+Source1 in chunks to look up candidates and writes results incrementally
+to disk. Peak memory is bounded by chunk size + index size, not by total
+row count.
 
 Usage:
-    python src/blocking.py --data-dir dataset/train --split train --top-k 20
+    python src/blocking.py --data-dir dataset/train --split train --out output/candidate_pairs_train.tsv
 """
 
 import argparse
 import re
+from collections import defaultdict
 
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.neighbors import NearestNeighbors
-
-from load_data import load_sources
-
 
 LEGAL_SUFFIX_MAP = {
     "corporation": "corp",
@@ -31,9 +33,11 @@ LEGAL_SUFFIX_MAP = {
     " and ": " & ",
 }
 
+MAX_BUCKET_SIZE = 50   # cap candidates stored per blocking key
+CHUNK_SIZE = 200_000   # rows read per chunk
+
 
 def normalize_name(name: str) -> str:
-    """Lowercase, strip punctuation, normalize common legal-suffix abbreviations."""
     name = str(name).lower().strip()
     name = re.sub(r"[^\w\s&]", "", name)
     for full, abbr in LEGAL_SUFFIX_MAP.items():
@@ -41,70 +45,121 @@ def normalize_name(name: str) -> str:
     return re.sub(r"\s+", " ", name).strip()
 
 
-def build_blocking_index(candidate_df: pd.DataFrame, top_k: int):
-    """
-    Fit a TF-IDF + NearestNeighbors index on candidate_df's normalized names.
-    Returns the fitted vectorizer and NN model for querying.
-    """
-    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=1)
-    tfidf_matrix = vectorizer.fit_transform(candidate_df["name_norm"])
-
-    n_neighbors = min(top_k, len(candidate_df))
-    nn = NearestNeighbors(n_neighbors=n_neighbors, metric="cosine")
-    nn.fit(tfidf_matrix)
-
-    return vectorizer, nn
+def make_keys(name_norm: str, country: str):
+    country_norm = str(country).lower().strip()
+    prefix_key = f"{country_norm}|{name_norm[:4]}"
+    first_token = name_norm.split()[0] if name_norm.split() else ""
+    token_key = f"{country_norm}|{first_token}"
+    return prefix_key, token_key
 
 
-def generate_candidates(s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFrame, top_k: int = 20):
-    """
-    For each Source1 entity, return top_k candidate entity_ids from
-    Source2 + Source3 combined, ranked by normalized-name similarity.
+def build_index_from_file(path: str):
+    """Stream a source TSV in chunks, building capped bucket indexes without
+    ever holding the full file in memory."""
+    prefix_index = defaultdict(list)
+    token_index = defaultdict(list)
 
-    Returns a DataFrame with columns: source1_entity_id, candidate_entity_ids (comma-joined str)
-    """
-    for df in (s1, s2, s3):
-        df["name_norm"] = df["business_name"].apply(normalize_name)
+    rows_seen = 0
+    for chunk in pd.read_csv(
+        path, sep="\t", chunksize=CHUNK_SIZE,
+        usecols=["entity_id", "business_name", "country"],
+        dtype=str,
+    ):
+        for entity_id, name, country in zip(
+            chunk["entity_id"], chunk["business_name"], chunk["country"]
+        ):
+            name_norm = normalize_name(name)
+            prefix_key, token_key = make_keys(name_norm, country)
+            if len(prefix_index[prefix_key]) < MAX_BUCKET_SIZE:
+                prefix_index[prefix_key].append(entity_id)
+            if len(token_index[token_key]) < MAX_BUCKET_SIZE:
+                token_index[token_key].append(entity_id)
+        rows_seen += len(chunk)
+        print(f"  indexed {rows_seen} rows from {path}...")
 
-    # Combine Source2 + Source3 into one candidate pool
-    pool = pd.concat(
-        [s2[["entity_id", "name_norm"]], s3[["entity_id", "name_norm"]]],
-        ignore_index=True,
-    )
+    return prefix_index, token_index
 
-    vectorizer, nn = build_blocking_index(pool, top_k)
 
-    s1_vectors = vectorizer.transform(s1["name_norm"])
-    distances, indices = nn.kneighbors(s1_vectors)
+def merge_index(dst_prefix, dst_token, src_prefix, src_token):
+    """Merge src bucket dicts into dst, respecting the size cap."""
+    for k, ids in src_prefix.items():
+        bucket = dst_prefix[k]
+        for eid in ids:
+            if len(bucket) >= MAX_BUCKET_SIZE:
+                break
+            bucket.append(eid)
+    for k, ids in src_token.items():
+        bucket = dst_token[k]
+        for eid in ids:
+            if len(bucket) >= MAX_BUCKET_SIZE:
+                break
+            bucket.append(eid)
 
-    results = []
-    for i, s1_id in enumerate(s1["entity_id"]):
-        candidate_ids = pool.iloc[indices[i]]["entity_id"].tolist()
-        # dedupe while preserving order
-        seen = set()
-        deduped = [c for c in candidate_ids if not (c in seen or seen.add(c))]
-        results.append({
-            "source1_entity_id": s1_id,
-            "candidate_entity_ids": ",".join(deduped),
-        })
 
-    return pd.DataFrame(results)
+def run_blocking(data_dir: str, split: str, out_path: str, max_candidates: int):
+    s2_path = f"{data_dir}/{split}_source2.tsv"
+    s3_path = f"{data_dir}/{split}_source3.tsv"
+    s1_path = f"{data_dir}/{split}_source1.tsv"
+
+    print(f"Building index from {s2_path} ...")
+    prefix_index, token_index = build_index_from_file(s2_path)
+
+    print(f"Building index from {s3_path} ...")
+    p3, t3 = build_index_from_file(s3_path)
+    merge_index(prefix_index, token_index, p3, t3)
+    del p3, t3
+
+    print(f"Index built. Prefix buckets: {len(prefix_index)}  Token buckets: {len(token_index)}")
+
+    # Stream Source1 and write results incrementally - never hold full output in memory
+    print(f"Scoring candidates for {s1_path} ...")
+    first_write = True
+    total_rows = 0
+    total_with_candidates = 0
+
+    for chunk in pd.read_csv(
+        s1_path, sep="\t", chunksize=CHUNK_SIZE,
+        usecols=["entity_id", "business_name", "country"],
+        dtype=str,
+    ):
+        out_rows = []
+        for entity_id, name, country in zip(
+            chunk["entity_id"], chunk["business_name"], chunk["country"]
+        ):
+            name_norm = normalize_name(name)
+            prefix_key, token_key = make_keys(name_norm, country)
+            candidates = set(prefix_index.get(prefix_key, [])) | set(token_index.get(token_key, []))
+            candidates = list(candidates)[:max_candidates]
+            if candidates:
+                total_with_candidates += 1
+            out_rows.append({
+                "source1_entity_id": entity_id,
+                "candidate_entity_ids": ",".join(candidates),
+            })
+
+        out_df = pd.DataFrame(out_rows)
+        out_df.to_csv(
+            out_path, sep="\t", index=False,
+            mode="w" if first_write else "a",
+            header=first_write,
+        )
+        first_write = False
+        total_rows += len(chunk)
+        print(f"  scored {total_rows} Source1 entities...")
+
+    print(f"\nDone. Wrote {total_rows} rows to {out_path}")
+    print(f"Entities with >=1 candidate: {total_with_candidates} ({total_with_candidates/total_rows*100:.1f}%)")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default="dataset/train")
     parser.add_argument("--split", default="train", choices=["train", "test"])
-    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--max-candidates", type=int, default=30)
     parser.add_argument("--out", default="output/candidate_pairs.tsv")
     args = parser.parse_args()
 
-    s1, s2, s3 = load_sources(args.data_dir, split=args.split)
-    candidates = generate_candidates(s1, s2, s3, top_k=args.top_k)
-
-    candidates.to_csv(args.out, sep="\t", index=False)
-    print(f"Wrote {len(candidates)} rows to {args.out}")
-    print(f"Avg candidates per entity: {candidates['candidate_entity_ids'].apply(lambda x: len(x.split(',')) if x else 0).mean():.1f}")
+    run_blocking(args.data_dir, args.split, args.out, args.max_candidates)
 
 
 if __name__ == "__main__":
